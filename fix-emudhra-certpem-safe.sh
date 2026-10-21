@@ -117,6 +117,7 @@ fi
 # ---------- choose, one certificate at a time ----------
 ( : < /dev/tty ) 2>/dev/null || die "No terminal available for confirmation; refusing to continue."
 DROP=""
+NDROP=0
 TMPLIST=$(mktemp)
 TMP=$(mktemp)
 trap 'rm -f "$TMPLIST" "$TMP"' EXIT
@@ -124,13 +125,13 @@ echo "$MATCHES" > "$TMPLIST"
 while IFS="$(printf '\t')" read -r idx subj; do
   if ask "Remove [$idx] $subj ? [y/N]"; then
     DROP="${DROP:+$DROP,}$idx"
+    NDROP=$((NDROP + 1))
   else
     echo "  keeping [$idx]"
   fi
 done < "$TMPLIST"
 
 [ -n "$DROP" ] || { echo "Nothing selected. No changes made."; exit 0; }
-NDROP=$(echo "$DROP" | tr ',' '\n' | wc -l | tr -d ' ')
 
 # ---------- build and check the new bundle ----------
 filter_out "$DROP" > "$TMP"

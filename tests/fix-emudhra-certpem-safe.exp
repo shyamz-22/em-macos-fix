@@ -1,0 +1,161 @@
+#!/usr/bin/expect -f
+
+set timeout 30
+set script [file normalize [file join [file dirname [info script]] .. fix-emudhra-certpem-safe.sh]]
+set root [exec mktemp -d]
+set shim [file join $root bin]
+set system_tmp [file dirname $root]
+file mkdir $shim
+
+proc fail {message} {
+    global root
+    puts stderr "FAIL: $message"
+    file delete -force $root
+    exit 1
+}
+
+proc make_cert {root name subject} {
+    set key [file join $root "$name.key"]
+    set cert [file join $root "$name.pem"]
+    if {[catch {exec openssl req -x509 -newkey rsa:2048 -nodes -keyout $key -out $cert -days 1 -subj $subject 2>@1} output]} {
+        fail "could not generate test certificate: $output"
+    }
+    return $cert
+}
+
+proc write_bundle {path records} {
+    set out [open $path w]
+    foreach record $records {
+        lassign $record subject cert
+        puts $out "### /C=US/CN=Test Issuer"
+        puts $out "=== $subject"
+        set input [open $cert r]
+        puts -nonewline $out [read $input]
+        close $input
+    }
+    close $out
+}
+
+proc read_file {path} {
+    set input [open $path r]
+    set value [read $input]
+    close $input
+    return $value
+}
+
+proc assert_equal {actual expected message} {
+    if {$actual ne $expected} {
+        fail $message
+    }
+}
+
+proc expect_prompt {pattern answer} {
+    expect {
+        -re $pattern { send -- "$answer\r" }
+        timeout { fail "timed out waiting for prompt: $pattern" }
+        eof { fail "script exited before prompt: $pattern" }
+    }
+}
+
+proc finish_child {expected_status} {
+    expect {
+        eof {}
+        timeout { fail "script did not exit" }
+    }
+    set result [wait]
+    set status [lindex $result 3]
+    if {$status != $expected_status} {
+        fail "expected exit status $expected_status, got $status"
+    }
+}
+
+set fake_sudo [open [file join $shim sudo] w]
+puts $fake_sudo {#!/bin/sh
+command=$1
+case "$command" in
+  cp|cmp) ;;
+  *) exit 90 ;;
+esac
+shift
+destination=
+for arg do
+  case "$arg" in
+    -*) ;;
+    "$TEST_ROOT"/*|"$TEST_SYSTEM_TMP"/tmp.*) destination=$arg ;;
+    *) echo "test sudo rejected path: $arg" >&2; exit 91 ;;
+  esac
+done
+if [ "$command" = cp ]; then
+  case "$destination" in
+    "$TEST_ROOT"/*) ;;
+    *) exit 91 ;;
+  esac
+fi
+case "$command" in
+  cp) exec /bin/cp "$@" ;;
+  cmp) exec /usr/bin/cmp "$@" ;;
+esac
+}
+close $fake_sudo
+file attributes [file join $shim sudo] -permissions 0755
+
+set affected_a [make_cert $root affected-a "/C=US/CN=AAA Certificate Services"]
+set unrelated [make_cert $root unrelated "/C=US/CN=Unrelated Test Root"]
+set affected_b [make_cert $root affected-b "/C=US/CN=emSign ECC Root CA - G3"]
+set original_records [list \
+    [list "/C=US/CN=AAA Certificate Services" $affected_a] \
+    [list "/C=US/CN=Unrelated Test Root" $unrelated] \
+    [list "/C=US/CN=emSign ECC Root CA - G3" $affected_b]]
+
+# Dry run must list both matches and leave the input unchanged.
+set bundle [file join $root dry-run.pem]
+write_bundle $bundle $original_records
+set before [read_file $bundle]
+set output [exec sh $script $bundle 2>@1]
+if {![string match "*AAA Certificate Services*" $output] || ![string match "*emSign ECC Root CA - G3*" $output]} {
+    fail "dry run did not list both matching certificates"
+}
+assert_equal [read_file $bundle] $before "dry run changed the bundle"
+puts "PASS: dry run lists matches and leaves the bundle unchanged"
+
+# Select the first match, keep the second, and confirm the write.
+set bundle [file join $root apply.pem]
+write_bundle $bundle $original_records
+set original [read_file $bundle]
+set env(PATH) "$shim:$env(PATH)"
+set env(TEST_ROOT) $root
+set env(TEST_SYSTEM_TMP) $system_tmp
+spawn -noecho env "PATH=$env(PATH)" "TEST_ROOT=$root" "TEST_SYSTEM_TMP=$system_tmp" sh $script --apply $bundle
+expect_prompt {Remove \[1\].*\? \[y/N\]} y
+expect_prompt {Remove \[3\].*\? \[y/N\]} n
+expect_prompt {Type YES to write .*:} YES
+finish_child 0
+
+set remaining [read_file $bundle]
+set expected_bundle [file join $root expected.pem]
+write_bundle $expected_bundle [lrange $original_records 1 end]
+assert_equal $remaining [read_file $expected_bundle] "apply did not remove only the selected certificate"
+set backups [glob -nocomplain "$bundle.bak.*"]
+if {[llength $backups] != 1} {
+    fail "expected one backup file, found [llength $backups]"
+}
+assert_equal [read_file [lindex $backups 0]] $original "backup does not match the original bundle"
+puts "PASS: apply removes selected certificate and preserves an exact backup"
+
+# A non-YES final answer must not write or create a backup.
+set bundle [file join $root reject-final.pem]
+write_bundle $bundle $original_records
+set before [read_file $bundle]
+spawn -noecho env "PATH=$env(PATH)" "TEST_ROOT=$root" "TEST_SYSTEM_TMP=$system_tmp" sh $script --apply $bundle
+expect_prompt {Remove \[1\].*\? \[y/N\]} y
+expect_prompt {Remove \[3\].*\? \[y/N\]} n
+expect_prompt {Type YES to write .*:} NO
+finish_child 1
+assert_equal [read_file $bundle] $before "declining final confirmation changed the bundle"
+if {[llength [glob -nocomplain "$bundle.bak.*"]] != 0} {
+    fail "declining final confirmation created a backup"
+}
+puts "PASS: final confirmation rejects any answer other than YES"
+
+file delete -force $root
+puts "All fix-script tests passed"
